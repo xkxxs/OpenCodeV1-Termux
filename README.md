@@ -48,9 +48,9 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/O
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
-| 依赖安装 | `pkg install patchelf nodejs-lts sudo/proot` (有 root 装 sudo, 无 root 自动装 proot) |
+| 依赖安装 | `pkg install patchelf nodejs-lts proot` (root 通过 `su` 识别, 不要求 Termux 的 sudo 包; proot 始终安装作 DNS 兜底) |
 | musl 运行库 | 从 Alpine 获取 ld-musl + libstdc++ + libgcc (已存在则跳过) |
-| DNS 修复 | 有 root: dns53 转发器 + `.bashrc` 常驻; 无 root: dns-bootstrap 实测校验 + proot 绑定; `dns53-aaaa on|off|status` 切换 AAAA 屏蔽 |
+| DNS 修复 | 有 root: dns53 转发器 + `.bashrc` 常驻 (心跳 `.alive` 判断存活, dns53 挂了自动用 proot 兜底); 无 root: dns-bootstrap 实测校验 + proot 绑定; `dns53-aaaa on|off|status` 切换 AAAA 屏蔽 |
 | 安装 OpenCode | GitHub API 查最新版 (mirror 优先) → 下载 musl tarball → patchelf ×2 → 验证 → 换入 |
 | 生成 wrapper | `~/.local/bin/opencode`: 启动前自动查版更新、`opencode update` 完整升级流程、修复 `~/.opencode/bin` PATH 陷阱 |
 | 验证 | `opencode --version` |

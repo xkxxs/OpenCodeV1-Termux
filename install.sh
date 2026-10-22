@@ -40,6 +40,59 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# ---------- root 判定 / 执行 ----------
+# Android 上有 root 不等于装了 Termux 的 sudo 包: Magisk/KernelSU 只提供 su,
+# 只判断 `sudo -n` 会把这类设备误判成无 root。探测结果缓存到 .root_mode
+# (direct|sudo|su|none), 避免每次启动都触发 su 授权弹窗。
+DNS53_DIR="${XDG_DATA_HOME:-$HOME_DIR/.local/share}/dns53"
+DNS_ROOT_MODE_FILE="$DNS53_DIR/.root_mode"
+
+detect_root_mode() {
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then echo direct; return 0; fi
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then echo sudo; return 0; fi
+    if command -v su >/dev/null 2>&1; then
+        local u
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+        [ "$u" = 0 ] && { echo su; return 0; }
+    fi
+    echo none
+}
+
+refresh_root_mode() {
+    mkdir -p "$DNS53_DIR" 2>/dev/null || true
+    detect_root_mode > "$DNS_ROOT_MODE_FILE" 2>/dev/null || true
+}
+
+root_mode() {
+    local m
+    m="$(cat "$DNS_ROOT_MODE_FILE" 2>/dev/null || true)"
+    [ -n "$m" ] || m="$(detect_root_mode)"
+    printf '%s' "$m"
+}
+
+have_root() { [ "$(root_mode)" != none ]; }
+
+root_exec() {
+    local m p
+    m="$(root_mode)"
+    p="${PREFIX:-/data/data/com.termux/files/usr}/bin:/system/bin:/system/xbin"
+    case "$m" in
+        direct) "$@" ;;
+        sudo)   sudo -n "$@" ;;
+        su)     su -c "PATH=$p:\$PATH $(printf '%q ' "$@")" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# dns53 心跳: 每 20s 刷新, 90s 内新鲜即视为在跑 (普通用户也能读, 不用 su pgrep)
+dns53_alive() {
+    local f="$DNS53_DIR/.alive" now mt
+    [ -f "$f" ] || return 1
+    now=$(date +%s)
+    mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    [ $((now - mt)) -lt 90 ]
+}
+
 # ---------- 环境检查 ----------
 check_environment() {
     if [ "$(uname -o 2>/dev/null || true)" != "Android" ] && [ ! -x "$PREFIX/bin/pkg" ]; then
@@ -57,10 +110,13 @@ install_dependencies() {
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
     # 有 root → dns53 原生方案; 无 root → proot 兜底
-    if command -v sudo >/dev/null 2>&1; then
-        if ! sudo -n true 2>/dev/null; then need+=(proot); fi
+    refresh_root_mode
+    if have_root; then
+        # dns53 挂掉时用 proot 绑 resolv.conf 兜底, 所以有 root 也装 proot
+        command -v proot >/dev/null 2>&1 || need+=(proot)
     else
-        need+=(sudo)
+        need+=(proot)
+        command -v sudo >/dev/null 2>&1 || need+=(sudo)
     fi
     if [ ${#need[@]} -gt 0 ]; then
         info "安装依赖: ${need[*]}"
@@ -68,7 +124,9 @@ install_dependencies() {
     else
         ok "依赖已就绪 (patchelf $(patchelf --version 2>/dev/null | grep -oE '[0-9.]+'), node $(node --version))"
     fi
-    if ! sudo -n true 2>/dev/null; then
+    if have_root; then
+        command -v proot >/dev/null 2>&1 || { info "安装 proot (dns53 失效时的 DNS 兜底)…"; pkg install -y proot; }
+    else
         command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
         warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
@@ -178,11 +236,14 @@ install_musl_libs() {
 # 有 root → dns53 本地转发器 + .bashrc 常驻
 # 无 root → dns-bootstrap 实测校验 + proot 绑定 resolv.conf (wrapper 运行时自动选择)
 fix_dns() {
-    local dns53="$HOME_DIR/.local/bin/dns53.js"
-    local dnsboot="$HOME_DIR/.local/bin/dns-bootstrap.js"
-    mkdir -p "$HOME_DIR/.local/bin"
+    # 与 opencode-termux 的 dns53 组件共用目录: 53 端口唯一, 一台设备只跑
+    # 一个 dns53 实例; 心跳/日志/诊断也统一到 ~/.local/share/dns53。
+    local dns53="$DNS53_DIR/dns53.js"
+    local dnsboot="$DNS53_DIR/dns-bootstrap.js"
+    mkdir -p "$DNS53_DIR" "$HOME_DIR/.local/bin"
+    refresh_root_mode
 
-    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+    if ! have_root; then
         info "未检测到 root, 使用 dns-bootstrap + proot 兜底"
         info "dns-bootstrap 会自动实测候选 DNS 应答质量 (SERVFAIL/空/被过滤全判废), 只写入真实可用的 resolv.conf"
         cat > "$dnsboot" << 'DNSBOOT_EOF'
@@ -208,13 +269,31 @@ const PROBE_DOMAINS = ['api.deepseek.com', 'www.baidu.com'];
 const TIMEOUT_MS = 2500;
 const RESOLV = process.env.DNS_RESOLV_CONF ||
   `${process.env.PREFIX || '/data/data/com.termux/files/usr'}/etc/resolv.conf`;
-const LOG = process.env.DNS_BOOTSTRAP_LOG ||
-  `${process.env.HOME || '/data/data/com.termux/files/home'}/.codex/dns-bootstrap.log`;
-const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
+const scriptDir = (() => {
+  try { return path.dirname(fs.realpathSync(process.argv[1] || __filename)); }
+  catch (_) { return __dirname; }
+})();
+const DNS_DIR = process.env.DNS53_DIR || scriptDir;
+const LOG = process.env.DNS_BOOTSTRAP_LOG || `${DNS_DIR}/logs/dns-bootstrap.log`;
+const log = (m) => {
+  try {
+    fs.mkdirSync(path.dirname(LOG), { recursive: true });
+    fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`);
+  } catch (_) {}
+};
 
 // 探测手机当前网络 DNS (与 dns53 同一套逻辑, 无 root 也能跑 dumpsys)
 function discoverPhoneDns() {
   const servers = [];
+  // 首选 bionic/netd 的当前服务器: 无子进程、无阻塞 (getprop/dumpsys 会卡 3-5s)。
+  try {
+    for (const ip of require('dns').getServers()) {
+      if (ip && !ip.includes(':')) servers.push(ip);
+    }
+  } catch (_) {}
+  if (servers.length) {
+    return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+  }
   try {
     const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
     for (const line of props.split('\n')) {
@@ -252,7 +331,8 @@ function queryDNS(server, host, timeout = TIMEOUT_MS) {
     const id = Buffer.from([Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)]);
     const q = Buffer.alloc(12 + 2 + host.length + 4);
     id.copy(q, 0);
-    q[5] = 1; // RD
+    q[2] = 0x01; // RD (flags 低字节)
+    q[5] = 1;    // QDCOUNT
     let off = 12;
     for (const part of host.split('.')) { q[off++] = part.length; q.write(part, off); off += part.length; }
     q[off++] = 0; q[off++] = 0; q[off++] = 1; q[off++] = 0; q[off++] = 1; // A IN
@@ -377,7 +457,7 @@ DNSBOOT_EOF
 // 运行: sudo node dns53.js  (53 是特权端口)
 const dgram = require('dgram');
 const fs = require('fs');
-const { execFileSync } = require('child_process');
+const path = require('path');
 
 // 公共兜底 DNS (手机 DNS 探测缺失时使用): IPv4 与 IPv6 各自独立
 const PUBLIC_DNS4 = [
@@ -391,14 +471,28 @@ const PUBLIC_DNS6 = [
   ['2408:8899::8', 53],   // 移动 IPv6
 ];
 const TIMEOUT_MS = 1500;
+// 单个上游等 250ms 没回就并行问下一个 (hedge): 国内 DNS 通常 <100ms,
+// 被墙/丢包的 8.8.8.8 要等满超时, 串行会卡 3-4 秒。
+const STAGGER_MS = 250;
 // AAAA 屏蔽开关 (默认开启): 屏蔽后客户端只走 IPv4,
 // 避免境外 IPv6 不可达导致连接卡死 (如 OpenAI 域名)。
 // 境内 IPv6 可用时, 可设 DNS53_DISABLE_AAAA=0 关闭屏蔽。
 const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA !== '0';
-// 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
-const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
+// 组件目录 = 本脚本所在目录 (与 agent 目录解耦; sudo 下 HOME 不可靠)
+const scriptDir = (() => {
+  try { return path.dirname(fs.realpathSync(process.argv[1] || __filename)); }
+  catch (_) { return __dirname; }
+})();
+const DNS_DIR = process.env.DNS53_DIR || scriptDir;
+const LOG = process.env.DNS53_LOG || `${DNS_DIR}/logs/dns53.log`;
+// 心跳: wrapper / check_dns 用它的 mtime 判断 dns53 是否活着,
+// 这样普通用户不用每次 su pgrep (避免授权弹窗), 也能在 dns53 挂掉时自动回退。
+const ALIVE = `${DNS_DIR}/.alive`;
+const beat = () => { try { fs.writeFileSync(ALIVE, String(Date.now())); } catch (_) {} };
+const clearAlive = () => { try { fs.unlinkSync(ALIVE); } catch (_) {} };
 const log = (m) => {
   try {
+    fs.mkdirSync(path.dirname(LOG), { recursive: true });
     fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`);
   } catch (_) {}
 };
@@ -421,46 +515,24 @@ let UPSTREAMS = [...PUBLIC_DNS4, ...PUBLIC_DNS6];
 function discoverPhoneDns() {
   const v4 = [];
   const v6 = [];
+  // 首选 bionic/netd 的当前服务器: 无子进程、无阻塞, 切网后 netd 会自动更新。
+  // (旧实现先跑 getprop / dumpsys connectivity 同步子进程, 最长阻塞 5s,
+  //  表现为每 60s 刷新时有一次查询卡 4 秒左右)
   try {
-    // 老版本 Android: getprop net.*.dnsN
-    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
-    for (const line of props.split('\n')) {
-      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9a-fA-F:.]+)\]/);
-      if (m) {
-        if (m[1].includes(':')) v6.push(m[1]); else v4.push(m[1]);
-      }
+    for (const ip of require('dns').getServers()) {
+      if (!ip) continue;
+      if (ip.includes(':')) v6.push(ip); else v4.push(ip);
     }
   } catch (_) {}
-  if (v4.length === 0 && v6.length === 0) {
-    try {
-      // 现代 Android: dumpsys connectivity 的 DnsAddresses。
-      // 优先默认网络 (TRANSPORT_PRIMARY), 再收集所有 INTERNET+VALIDATED 网络,
-      // 避免个别机型/网络下主网络块 DnsAddresses 为空时拿不到 DNS。
-      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
-      const blocks = out.split('NetworkAgentInfo{').slice(1);
-      const scored = [];
-      for (const b of blocks) {
-        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
-        if (!dm) continue;
-        const a4 = [];
-        const a6 = [];
-        for (const token of dm[1].split(/[\s,]+/)) {
-          const ip = token.replace(/^\//, '');
-          if (!ip) continue;
-          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) a4.push(ip);
-          else if (/^[0-9a-fA-F:.]+$/.test(ip) && ip.includes(':')) a6.push(ip);
-        }
-        if (!a4.length && !a6.length) continue;
-        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
-        scored.push([score, a4, a6]);
-      }
-      scored.sort((a, b) => a[0] - b[0]);
-      for (const [, a4, a6] of scored) {
-        v4.push(...a4);
-        v6.push(...a6);
-      }
-    } catch (_) {}
+  if (v4.length || v6.length) {
+    return {
+      v4: [...new Set(v4)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0'),
+      v6: [...new Set(v6)].filter((ip) => ip !== '::1' && ip !== '::'),
+    };
   }
+  // 不再用 getprop/dumpsys 同步兜底: root 下 getServers 可能为空, 而 dumpsys
+  // 会阻塞事件循环 3-5s (每 60s 刷新 → 查询卡顿)。拿不到手机 DNS 时,
+  // refreshDns 会退回 PUBLIC_DNS* 列表 (国内公共 DNS 在前)。
   return {
     v4: [...new Set(v4)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0'),
     v6: [...new Set(v6)].filter((ip) => ip !== '::1' && ip !== '::'),
@@ -471,12 +543,19 @@ function discoverPhoneDns() {
 function refreshDns() {
   const phone = discoverPhoneDns();
   if (phone.v4.length === 0 && phone.v6.length === 0) return;
+  const now = Date.now();
+  for (const [h, t] of DEMOTED) if (now - t > DEMOTE_TTL) DEMOTED.delete(h);
   const merged = [];
   const add = (ip) => {
     if (!merged.some((s) => s[0] === ip)) merged.push([ip, 53]);
   };
   for (const ip of [...phone.v4, ...PUBLIC_DNS4.map((s) => s[0])]) add(ip);
   for (const ip of [...phone.v6, ...PUBLIC_DNS6.map((s) => s[0])]) add(ip);
+  // 降级过的主机保持置底, 直到 TTL 到期
+  // (否则每分钟的 refreshDns 会按手机顺序重建, 把坏上游又排回第一位)
+  if (DEMOTED.size) {
+    merged.sort((a, b) => (DEMOTED.has(a[0]) ? 1 : 0) - (DEMOTED.has(b[0]) ? 1 : 0));
+  }
   if (JSON.stringify(merged) !== JSON.stringify(UPSTREAMS)) {
     UPSTREAMS = merged;
     log(`dns servers: ${merged.map((s) => s[0]).join(', ')}`);
@@ -486,6 +565,9 @@ function refreshDns() {
 // 连续空应答计数: 记录各上游的连续"被过滤"次数, 达到阈值后降级到底部
 const strikes = new Map();
 const MAX_STRIKES = 3;
+// 已降级的主机 (host -> 时间); refreshDns 重建上游列表时保持置底, TTL 后恢复
+const DEMOTED = new Map();
+const DEMOTE_TTL = 10 * 60 * 1000;
 
 // 判断应答是否有效: 返回 true = 应答异常, 应换下一个上游。
 // 覆盖: 报文过短 / SERVFAIL / A 查询 rcode=0 但答案为空 / A 查询只回 CNAME 没给 A
@@ -525,14 +607,15 @@ function isBadResponse(resp, qtype) {
   return true; // A 查询答案区只有 CNAME/NS 等, 没有地址记录
 }
 
-// 降级: 把 host 移到列表末尾, 下次刷新会按新的手机 DNS 顺序重建
+// 降级: 移到列表末尾并记录, 刷新时保持置底
 function demote(host) {
+  DEMOTED.set(host, Date.now());
   const idx = UPSTREAMS.findIndex((s) => s[0] === host);
-  if (idx > 0) {
+  if (idx >= 0) {
     const [s] = UPSTREAMS.splice(idx, 1);
     UPSTREAMS.push(s);
-    log(`demoted bad upstream ${host}`);
   }
+  log(`demoted bad upstream ${host}`);
 }
 
 // 从查询报文解析 qtype (跳过问题名, 不受 EDNS 附加区影响)
@@ -626,7 +709,8 @@ function netdFallback(msg, rinfo, qtype, onDone, qid) {
   const family = qtype === 1 ? 4 : 6;
   const t1 = Date.now();
   netd.lookup(host, { family, timeout: 5000 }, (err, ip) => {
-    if (onDone) onDone();
+    // onDone 返回 false 表示已有上游先应答, 这里不能再发第二份
+    if (onDone && onDone() === false) return;
     if (err) {
       // NXDOMAIN 或解析失败: 回 rcode=3 (合法应答, 客户端正常处理)
       const resp = Buffer.alloc(12 + msg.length - 12);
@@ -663,42 +747,60 @@ server.on('message', (msg, rinfo) => {
   }
   let done = false;
   let netdStarted = false;
-  // 任一上游失败 → 立即启动 netd 兜底 (netd 与上游竞争, 先回先赢, done 防双发)
+  // 任一上游失败 → 并行启动 netd 兜底 (先回先赢; onDone 返回 false = 已有应答, 不再发)
   const startNetd = () => {
     if (netdStarted || done) return;
     netdStarted = true;
     log(`>> q${qid} netd fallback started (${Date.now() - t0}ms in)`);
-    netdFallback(msg, rinfo, qtype, () => { done = true; }, qid);
+    netdFallback(msg, rinfo, qtype, () => {
+      if (done) return false;
+      done = true;
+      return true;
+    }, qid);
   };
+  // 快照本次查询的上游列表: demote/refreshDns 会改 UPSTREAMS, 迭代中不能用活引用
+  const upstreams = UPSTREAMS.slice();
   let i = 0;
+  // 依次尝试上游; 失败的那个计 strike (超时也算), 达到阈值降级,
+  // 然后继续试下一个上游 —— 同时并行启动 netd 兜底, 避免串行等待过长。
   const tryNext = () => {
     if (done) return;
-    if (i >= UPSTREAMS.length) { startNetd(); return; }
-    const [host, port] = UPSTREAMS[i++];
+    if (i >= upstreams.length) { startNetd(); return; }
+    const [host, port] = upstreams[i++];
     const t1 = Date.now();
     const tag = `q${qid}->${host}`;
     const sock = dgram.createSocket(host.includes(':') ? 'udp6' : 'udp4');
     let doneHere = false;
+    let hedge = null;
     const finish = (fn) => {
       if (doneHere) return;
       doneHere = true;
       clearTimeout(timer);
+      if (hedge) clearTimeout(hedge);
       sock.close();
       fn();
     };
-    const timer = setTimeout(() => finish(() => { log(`timeout ${tag} (${Date.now() - t1}ms)`); startNetd(); }), TIMEOUT_MS);
+    const fail = (why) => {
+      if (done) { finish(() => {}); return; }  // 其他上游/netd 已应答, 别再计 strike
+      finish(() => {
+        const n = (strikes.get(host) || 0) + 1;
+        strikes.set(host, n);
+        if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
+        log(`${why} ${tag} (${Date.now() - t1}ms, strike ${n}/${MAX_STRIKES})`);
+        startNetd();
+        tryNext();
+      });
+    };
+    const timer = setTimeout(() => fail('timeout'), TIMEOUT_MS);
+    // 并行 hedge: 不等这个上游超时, 250ms 后同时问下一个, 先回先赢
+    hedge = setTimeout(() => {
+      if (doneHere || done) return;
+      tryNext();
+    }, STAGGER_MS);
     sock.on('message', (resp) => {
       if (doneHere) return;
-      if (isBadResponse(resp, qtype)) {
-        finish(() => {
-          const n = (strikes.get(host) || 0) + 1;
-          strikes.set(host, n);
-          if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
-          log(`bad response ${tag} (${Date.now() - t1}ms, strike ${n}/${MAX_STRIKES})`);
-          startNetd();
-        });
-        return;
-      }
+      if (done) { finish(() => {}); return; }  // 防双发: 已有人先回过了
+      if (isBadResponse(resp, qtype)) { fail('bad response'); return; }
       finish(() => {
         if (strikes.has(host)) strikes.delete(host);
         done = true;
@@ -706,9 +808,9 @@ server.on('message', (msg, rinfo) => {
         log(`<< q${qid} ${qhost} OK via ${host} (${Date.now() - t1}ms, total ${Date.now() - t0}ms)`);
       });
     });
-    sock.on('error', (e) => finish(() => { log(`error ${tag}: ${e.message} (${Date.now() - t1}ms)`); startNetd(); }));
+    sock.on('error', (e) => fail(`error: ${e.message}`));
     sock.send(msg, port, host, (e) => {
-      if (e) finish(() => { log(`send error ${tag}: ${e.message}`); startNetd(); });
+      if (e) fail(`send error: ${e.message}`);
     });
   };
   tryNext();
@@ -722,11 +824,17 @@ server.on('error', (e) => {
 });
 server.bind(53, '127.0.0.1', () => {
   refreshDns();
+  beat();
+  setInterval(beat, 20000);
   log('dns53 listening on 127.0.0.1:53');
   if (process.stdout.isTTY) console.log('dns53 listening on 127.0.0.1:53');
   setInterval(refreshDns, 60000);
 });
 
+process.on('exit', clearAlive);
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => { clearAlive(); process.exit(0); });
+}
 DNS53_EOF
     chmod +x "$dns53"
     info "dns53.js 已更新: $dns53"
@@ -736,108 +844,223 @@ DNS53_EOF
 # 用法: dns53-aaaa on|off|status
 set -euo pipefail
 
-D53="$HOME/.local/bin/dns53.js"
-LOG="$HOME/.codex/dns53.log"
+D53="$HOME/.local/share/dns53/dns53.js"
+LOG="$HOME/.local/share/dns53/logs/dns53.log"
+MODE="$(cat "$HOME/.local/share/dns53/.root_mode" 2>/dev/null || echo none)"
+
+root_exec() {
+    case "$MODE" in
+        direct) "$@" ;;
+        sudo)   sudo -n "$@" ;;
+        su)     su -c "PATH=${PREFIX:-/data/data/com.termux/files/usr}/bin:/system/bin:/system/xbin:\$PATH $(printf '%q ' "$@")" ;;
+        *)      echo "需要 root (未检测到 root/su)" >&2; return 1 ;;
+    esac
+}
 
 get_pid() {
-  sudo -n pgrep -f '^node .*dns5[3]\.js' 2>/dev/null | head -1
+    root_exec pgrep -f '^node .*dns5[3]\.js' 2>/dev/null | head -1
 }
 
 show_status() {
-  local pid mode
-  pid=$(get_pid)
-  if [ -z "$pid" ]; then
-    echo "dns53 未运行"
-    return
-  fi
-  mode=$(sudo -n cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | sed -n 's/^DNS53_DISABLE_AAAA=//p')
-  if [ "$mode" = "0" ]; then
-    echo "关闭（放行 AAAA/IPv6）| PID $pid"
-  else
-    echo "开启（屏蔽 AAAA，只走 IPv4）| PID $pid"
-  fi
+    local pid mode
+    pid=$(get_pid)
+    if [ -z "$pid" ]; then
+        echo "dns53 未运行"
+        return
+    fi
+    mode=$(root_exec cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | sed -n 's/^DNS53_DISABLE_AAAA=//p')
+    if [ "$mode" = "0" ]; then
+        echo "关闭（放行 AAAA/IPv6）| PID $pid"
+    else
+        echo "开启（屏蔽 AAAA，只走 IPv4）| PID $pid"
+    fi
 }
 
 restart() {
-  local val="$1" label="$2"
-  sudo -n pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
-  sleep 1
-  sudo -n env DNS53_DISABLE_AAAA="$val" nohup node "$D53" > "$LOG" 2>&1 &
-  sleep 1
-  echo "✓ $label"
-  show_status
+    local val="$1" label="$2"
+    root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+    sleep 1
+    mkdir -p "$HOME/.local/share/dns53/logs"
+    root_exec env DNS53_DISABLE_AAAA="$val" nohup node "$D53" > "$LOG" 2>&1 &
+    sleep 1
+    echo "✓ $label"
+    show_status
 }
 
 case "${1:-status}" in
-  on)  restart 1 "AAAA 屏蔽已开启（默认，只走 IPv4）" ;;
-  off) restart 0 "AAAA 屏蔽已关闭（放行 IPv6）" ;;
-  status) show_status ;;
-  *) echo "用法: dns53-aaaa on|off|status" >&2; exit 1 ;;
+    on)  restart 1 "AAAA 屏蔽已开启（默认，只走 IPv4）" ;;
+    off) restart 0 "AAAA 屏蔽已关闭（放行 IPv6）" ;;
+    status) show_status ;;
+    *) echo "用法: dns53-aaaa on|off|status" >&2; exit 1 ;;
 esac
 AAAA_EOF
     chmod +x "$HOME_DIR/.local/bin/dns53-aaaa"
     info "dns53-aaaa 切换脚本已生成: ~/.local/bin/dns53-aaaa"
 
-    if ! grep -q 'dns53' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
+    # 幂等更新 hook: 旧版是 sudo -n, Magisk 设备上永远起不来 → 先删旧块再写。
+    # 新块有结束标记; 旧块没有, 只能删到第一个独立 fi (旧块内无嵌套 fi)。
+    if grep -q '# ===== DNS 转发器结束 =====' "$HOME_DIR/.bashrc" 2>/dev/null; then
+        sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/# ===== DNS 转发器结束 =====/d' "$HOME_DIR/.bashrc"
+    elif grep -q 'DNS 转发器常驻 (dns53)' "$HOME_DIR/.bashrc" 2>/dev/null; then
+        sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/^fi$/d' "$HOME_DIR/.bashrc"
+    fi
+    cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
 
 # ===== DNS 转发器常驻 (dns53) =====
 # 背景: musl 程序 (codex/opencode) 的解析器读不到 /etc/resolv.conf (Android 没有),
 #       回退到 127.0.0.1:53, 而手机无人监听 → DNS 卡死 5s 超时。
-# dns53.js 在本机 53 端口监听, 转发到阿里/腾讯/电信 DNS, 是这些程序的唯一出路。
-# 每次打开 Termux 终端检查一次, 没在跑就拉起 (root 绑定特权端口)。
-if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
-    sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
-    sleep 1
+# 心跳: dns53 每 20s 写 .alive; 90s 内新鲜即视为在跑。用心跳而不是 pgrep:
+#       普通用户 pgrep root 进程不可靠, 而每次 su 又可能弹授权框。
+__dns_dir="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
+__dns_mt=0
+if [ -r "$__dns_dir/.alive" ]; then
+    __dns_mt=$(stat -c %Y "$__dns_dir/.alive" 2>/dev/null || echo 0)
 fi
+if [ $(( $(date +%s) - __dns_mt )) -ge 90 ] && [ -f "$__dns_dir/dns53.js" ]; then
+    __dns_mode=$(cat "$__dns_dir/.root_mode" 2>/dev/null || echo none)
+    case "$__dns_mode" in
+        direct) nohup node "$__dns_dir/dns53.js" >/dev/null 2>&1 & ;;
+        sudo)   sudo -n nohup node "$__dns_dir/dns53.js" >/dev/null 2>&1 & ;;
+        su)     su -c "${PREFIX:-/data/data/com.termux/files/usr}/bin/node $__dns_dir/dns53.js >/dev/null 2>&1 &" ;;
+    esac
+    unset __dns_mode
+fi
+unset __dns_dir __dns_mt
+# ===== DNS 转发器结束 =====
 BASHRC_EOF
-        info "dns53 常驻逻辑已写入 ~/.bashrc"
-    fi
+    info "dns53 常驻逻辑已写入 ~/.bashrc"
 
-    if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
-        sudo -n nohup node "$dns53" > "$HOME_DIR/.codex/dns53.log" 2>&1 &
-        sleep 1
-        ok "DNS 转发器已启动 (127.0.0.1:53)"
-    else
+    if dns53_alive; then
         ok "DNS 转发器已在运行"
+    else
+        # 旧版 dns53 (2.0.0) 没有心跳: 进程在跑但 .alive 缺失 → 重启到新代码,
+        # 否则 53 端口被旧进程占着, 新实例起不来, wrapper 也就永远看不到心跳。
+        root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+        sleep 1
+        mkdir -p "$DNS53_DIR/logs"
+        root_exec nohup node "$dns53" > "$DNS53_DIR/logs/dns53.log" 2>&1 &
+        sleep 1
+        if dns53_alive; then
+            ok "DNS 转发器已启动 (127.0.0.1:53)"
+        else
+            warn "DNS 转发器启动失败 (日志: $DNS53_DIR/logs/dns53.log), 启动时将用 proot 兜底"
+        fi
     fi
 
     # 诊断工具
-    local dnsq="$HOME_DIR/.local/bin/dnsq.js"
+    local dnsq="$DNS53_DIR/dnsq.js"
     local check="$HOME_DIR/.check_dns.sh"
     cat > "$dnsq" << 'DNSQ_EOF'
 #!/usr/bin/env node
-// dnsq.js — 经 127.0.0.1:53 (dns53 转发链) 查询域名 A 记录
-// 用法: node dnsq.js <host>
-const { Resolver } = require('dns').promises;
+// dnsq.js — 用原始 UDP 查询域名 A 记录
+// 用法: node dnsq.js <host> [dns-server]
+//   默认查 127.0.0.1:53 (dns53 转发器); 无 root 方案下传 resolv.conf 的 nameserver
+//
+// 注意: 不能用 require('dns').Resolver({servers}) —— 在 Termux (bionic) 上
+// 它可能忽略自定义 server, 一律交给 netd, 导致 "没有监听也能解析成功" 的假象。
+const dgram = require('dgram');
 const host = process.argv[2];
-if (!host) { console.error('usage: node dnsq.js <host>'); process.exit(2); }
-const r = new Resolver({ servers: ['127.0.0.1'], timeout: 3000, retries: 0 });
+const server = process.argv[3] || '127.0.0.1';
+if (!host) {
+  console.error('usage: node dnsq.js <host> [server]');
+  process.exit(2);
+}
+
 const t0 = Date.now();
-r.resolve4(host).then((ips) => {
-  console.log(`  ${host} → OK IPs=[${ips.join(',')}] (${Date.now() - t0}ms)`);
-  process.exit(0);
-}).catch((e) => {
-  console.log(`  ${host} → ★ ${e.code || 'ERR'} (${Date.now() - t0}ms)`);
-  process.exit(1);
+const id = (Math.random() * 65536) | 0;
+
+function buildQuery() {
+  const labels = host.split('.').filter(Boolean);
+  const size = 12 + labels.reduce((n, l) => n + 1 + l.length, 0) + 5;
+  const b = Buffer.alloc(size);
+  b.writeUInt16BE(id, 0);
+  b.writeUInt16BE(0x0100, 2); // RD
+  b.writeUInt16BE(1, 4); // QDCOUNT
+  let o = 12;
+  for (const l of labels) {
+    b[o++] = l.length;
+    b.write(l, o, 'ascii');
+    o += l.length;
+  }
+  b[o++] = 0;
+  b.writeUInt16BE(1, o); // A
+  b.writeUInt16BE(1, o + 2); // IN
+  return b;
+}
+
+function skipName(buf, o) {
+  while (o < buf.length) {
+    const l = buf[o];
+    if (l === 0) return o + 1;
+    if ((l & 0xc0) === 0xc0) return o + 2;
+    o += l + 1;
+  }
+  return o;
+}
+
+function done(line, code) {
+  console.log(line);
+  try { sock.close(); } catch (_) {}
+  process.exit(code);
+}
+
+const sock = dgram.createSocket(server.includes(':') ? 'udp6' : 'udp4');
+const timer = setTimeout(() => done(`  ${host} @${server} → ★ TIMEOUT (${Date.now() - t0}ms)`, 1), 3000);
+
+sock.on('error', (e) => done(`  ${host} @${server} → ★ ${e.code || e.message} (${Date.now() - t0}ms)`, 1));
+sock.on('message', (resp) => {
+  clearTimeout(timer);
+  const ms = Date.now() - t0;
+  if (resp.length < 12 || resp.readUInt16BE(0) !== id) {
+    return done(`  ${host} @${server} → ★ 响应不匹配 (${ms}ms)`, 1);
+  }
+  const rcode = resp.readUInt16BE(2) & 0xf;
+  const ancount = resp.readUInt16BE(6);
+  const ips = [];
+  try {
+    let o = skipName(resp, 12) + 4; // 跳过问题 (name + type + class)
+    for (let i = 0; i < ancount && o + 10 <= resp.length; i++) {
+      o = skipName(resp, o);
+      if (o + 10 > resp.length) break;
+      const type = resp.readUInt16BE(o);
+      const rdlen = resp.readUInt16BE(o + 8);
+      o += 10;
+      if (type === 1 && rdlen === 4) ips.push(`${resp[o]}.${resp[o + 1]}.${resp[o + 2]}.${resp[o + 3]}`);
+      o += rdlen;
+    }
+  } catch (_) {}
+  if (ips.length) return done(`  ${host} @${server} → OK IPs=[${ips.join(',')}] (${ms}ms)`, 0);
+  const why = rcode === 3 ? 'NXDOMAIN' : rcode !== 0 ? `rcode=${rcode}` : 'NO-A';
+  done(`  ${host} @${server} → ★ ${why} (${ms}ms)`, 1);
+});
+
+const q = buildQuery();
+sock.send(q, 0, q.length, 53, server, (err) => {
+  if (err) done(`  ${host} @${server} → ★ ${err.code || err.message} (${Date.now() - t0}ms)`, 1);
 });
 DNSQ_EOF
     cat > "$check" << 'CHECK_EOF'
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 # check_dns.sh — 一键判断"DNS 问题 vs 网络/服务器问题"
 # 用法: bash ~/.check_dns.sh [域名...]
-DNSQ=/data/data/com.termux/files/home/.local/bin/dnsq.js
-LOG=/data/data/com.termux/files/home/.codex/dns53.log
+DNS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
+DNSQ="$DNS_DIR/dnsq.js"
+LOG="$DNS_DIR/logs/dns53.log"
 HOSTS=(api.deepseek.com api.anthropic.com opencode.ai www.baidu.com)
 [ $# -gt 0 ] && HOSTS=("$@")
 
 echo "═══ 诊断 $(date '+%F %T') ═══"
 
 echo "── dns53 状态 ──"
-if sudo -n ss -ulnp 2>/dev/null | grep -q "127.0.0.1:53"; then
-  echo "运行中"
+alive=0
+if [ -f "$DNS_DIR/.alive" ]; then
+  mt=$(stat -c %Y "$DNS_DIR/.alive" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - mt )) -lt 90 ] && alive=1
+fi
+if [ "$alive" = 1 ]; then
+  echo "运行中 (root 模式: $(cat "$DNS_DIR/.root_mode" 2>/dev/null || echo '?'))"
 else
-  echo "★ 未运行! 请重开终端或手动: sudo nohup node ~/.local/bin/dns53.js &"
+  echo "★ 未运行! 请重开终端; 或: su -c \"nohup node $DNS_DIR/dns53.js &\""
 fi
 grep 'dns servers:' "$LOG" 2>/dev/null | tail -1 || echo "(无日志)"
 
@@ -1002,7 +1225,7 @@ download_asset() {
 run_opencode() {
     local bin="$1"; shift
     local _env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    if [ "$(root_mode)" != none ]; then
         $_env "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
         proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" $_env "$bin" "$@"
@@ -1098,9 +1321,43 @@ case "${1:-}" in
                 fi
             fi
         fi
-        # exec 不能调 bash 函数, 内联 proot 逻辑
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            exec "$REAL_BIN" "$@"
+        # DNS: musl 读不到 /etc/resolv.conf, 默认查 127.0.0.1:53。
+        # 心跳新鲜才代表 dns53 真在跑; 只看 root 会误判 (dns53 挂了 → 原生直跑 = DNS 全挂)。
+        __dns_dir="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
+        __alive=0
+        if [ -f "$__dns_dir/.alive" ]; then
+            __mt=$(stat -c %Y "$__dns_dir/.alive" 2>/dev/null || echo 0)
+            [ $(( $(date +%s) - __mt )) -lt 90 ] && __alive=1
+        fi
+        __rmode=$(cat "$__dns_dir/.root_mode" 2>/dev/null || echo none)
+        if [ "$__rmode" = none ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            __rmode=sudo
+        fi
+        if [ "$__rmode" != none ]; then
+            # root 但 dns53 没在跑: 先按缓存的模式拉起, 起不来再走 proot
+            if [ "$__alive" = 0 ] && [ -f "$__dns_dir/dns53.js" ]; then
+                mkdir -p "$__dns_dir/logs"
+                case "$__rmode" in
+                    direct) nohup node "$__dns_dir/dns53.js" >> "$__dns_dir/logs/dns53.log" 2>&1 & ;;
+                    sudo)   sudo -n nohup node "$__dns_dir/dns53.js" >> "$__dns_dir/logs/dns53.log" 2>&1 & ;;
+                    su)     su -c "${PREFIX:-/data/data/com.termux/files/usr}/bin/node $__dns_dir/dns53.js >> $__dns_dir/logs/dns53.log 2>&1 &" ;;
+                esac
+                sleep 1
+                if [ -f "$__dns_dir/.alive" ]; then
+                    __mt=$(stat -c %Y "$__dns_dir/.alive" 2>/dev/null || echo 0)
+                    [ $(( $(date +%s) - __mt )) -lt 90 ] && __alive=1
+                fi
+            fi
+            if [ "$__alive" = 1 ]; then
+                exec "$REAL_BIN" "$@"
+            elif command -v proot >/dev/null 2>&1 && [ -f "${PREFIX}/etc/resolv.conf" ]; then
+                # dns53 起不来: proot 绑实测过的 resolv.conf, 避免 127.0.0.1 全失败
+                node "$__dns_dir/dns-bootstrap.js" >/dev/null 2>&1 || true
+                exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+            else
+                echo "!! dns53 未运行且无法用 proot 兜底, 直接启动 (DNS 可能失效)" >&2
+                exec "$REAL_BIN" "$@"
+            fi
         elif command -v proot >/dev/null 2>&1; then
             exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
         else
@@ -1149,7 +1406,7 @@ uninstall() {
     fi
     ok "已卸载"
     warn "DNS 转发器 (dns53) 已保留 — codex 等其他 musl 程序可能依赖它"
-    warn "如需一并移除: rm ~/.local/bin/dns53.js 并删除 ~/.bashrc 中的 dns53 常驻块"
+    warn "如需一并移除: bash ~/.local/share/dns53/install.sh --uninstall (或 rm -rf ~/.local/share/dns53)"
     exit 0
 }
 
