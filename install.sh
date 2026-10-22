@@ -231,9 +231,32 @@ install_musl_libs() {
     ok "C++ 运行库已安装到 $RPATH"
 }
 
+# ---------- shell rc (bash + zsh) ----------
+# 默认 shell 是 zsh 时不会读 ~/.bashrc, 只写 .bashrc 的 PATH / DNS 钩子等于没设。
+# 按 $SHELL / 已安装的 zsh / 已有的 .zshrc 判断要写哪些 rc 文件。
+shell_rcs() {
+    printf '%s\n' "$HOME_DIR/.bashrc"
+    if [ "$(basename "${SHELL:-bash}")" = "zsh" ] \
+       || [ -f "$HOME_DIR/.zshrc" ] \
+       || command -v zsh >/dev/null 2>&1; then
+        printf '%s\n' "$HOME_DIR/.zshrc"
+    fi
+}
+
+ensure_path_rc() {
+    local rc
+    while IFS= read -r rc; do
+        [ -e "$rc" ] || : > "$rc"
+        if ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+            info "~/.local/bin 已加入 PATH ($rc)"
+        fi
+    done < <(shell_rcs)
+}
+
 # ---------- DNS 修复 ----------
 # musl 解析器读不到 /etc/resolv.conf (Android 没有), 回退 127.0.0.1:53
-# 有 root → dns53 本地转发器 + .bashrc 常驻
+# 有 root → dns53 本地转发器 + .bashrc / .zshrc 常驻
 # 无 root → dns-bootstrap 实测校验 + proot 绑定 resolv.conf (wrapper 运行时自动选择)
 fix_dns() {
     # 与 opencode-termux 的 dns53 组件共用目录: 53 端口唯一, 一台设备只跑
@@ -899,12 +922,15 @@ AAAA_EOF
 
     # 幂等更新 hook: 旧版是 sudo -n, Magisk 设备上永远起不来 → 先删旧块再写。
     # 新块有结束标记; 旧块没有, 只能删到第一个独立 fi (旧块内无嵌套 fi)。
-    if grep -q '# ===== DNS 转发器结束 =====' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/# ===== DNS 转发器结束 =====/d' "$HOME_DIR/.bashrc"
-    elif grep -q 'DNS 转发器常驻 (dns53)' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/^fi$/d' "$HOME_DIR/.bashrc"
-    fi
-    cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
+    # zsh 用户不读 .bashrc, 两个 rc 文件都写。
+    local rc
+    while IFS= read -r rc; do
+        if grep -q '# ===== DNS 转发器结束 =====' "$rc" 2>/dev/null; then
+            sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/# ===== DNS 转发器结束 =====/d' "$rc"
+        elif grep -q 'DNS 转发器常驻 (dns53)' "$rc" 2>/dev/null; then
+            sed -i '/# ===== DNS 转发器常驻 (dns53) =====/,/^fi$/d' "$rc"
+        fi
+        cat >> "$rc" << 'BASHRC_EOF'
 
 # ===== DNS 转发器常驻 (dns53) =====
 # 背景: musl 程序 (codex/opencode) 的解析器读不到 /etc/resolv.conf (Android 没有),
@@ -928,7 +954,8 @@ fi
 unset __dns_dir __dns_mt
 # ===== DNS 转发器结束 =====
 BASHRC_EOF
-    info "dns53 常驻逻辑已写入 ~/.bashrc"
+        info "dns53 常驻逻辑已写入 $rc"
+    done < <(shell_rcs)
 
     if dns53_alive; then
         ok "DNS 转发器已在运行"
@@ -1368,10 +1395,7 @@ esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
-    if ! grep -q '\.local/bin' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME_DIR/.bashrc"
-        info "~/.local/bin 已加入 PATH (~/.bashrc)"
-    fi
+    ensure_path_rc
 
     # PATH 陷阱: 官方安装脚本 (opencode.ai/install) 创建的 ~/.opencode/bin
     # 排在 PATH 前面, 里面可能是跑不起来的 glibc 版; 换成 wrapper 副本
@@ -1421,7 +1445,7 @@ show_guide() {
     echo "    export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic"
     echo "    export ANTHROPIC_AUTH_TOKEN=sk-你的APIKey"
     echo "    export ANTHROPIC_MODEL=deepseek-v4-flash"
-    echo "    (持久化: 追加到 ~/.bashrc)"
+    echo "    (持久化: 追加到 ~/.bashrc; zsh 用户为 ~/.zshrc)"
     echo
     echo "  常用命令:"
     echo "    opencode                  启动"
