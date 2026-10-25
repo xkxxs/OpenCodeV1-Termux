@@ -42,6 +42,8 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/OpenCodeV1-Termux@main/insta
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/OpenCodeV1-Termux/main/install.sh)
 ```
 
+> **安装完成后请退出 Termux 并重新打开，或新开一个会话**，让 PATH 和环境变量生效。
+
 ## 后台保活建议
 
 Android 可能在息屏后杀掉 Termux 进程，导致长任务中断。装完后建议做三件事（不同 ROM 的名称/路径略有差异）：
